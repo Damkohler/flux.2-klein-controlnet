@@ -16,10 +16,16 @@ original behavior with this routing or the corrected preprocessing.
 
 ## CPU regression tests
 
-Use the existing Python/PyTorch/Diffusers environment on Windows. The suite uses
-reduced native transformer classes, synthetic text/images, and a VAE fixture;
-temporary synthetic checkpoints are removed. Windows process-memory counters
-enforce a conservative 2 GiB limit. No pretrained weights are needed.
+The suite targets Windows and Linux using reduced native transformer classes,
+synthetic text/images, and a VAE fixture; temporary synthetic checkpoints are
+removed. No pretrained weights are needed. The 2 GiB guard checks Windows peak
+working set/private commit, or Linux peak RSS (`ru_maxrss`, converted from KiB).
+These measurements are not equivalent: Linux RSS does not measure private
+commit ([Linux units](https://man7.org/linux/man-pages/man2/getrusage.2.html)).
+The guard checks process peaks at module setup/teardown; it is not an
+OS allocation limit or a continuous monitor. Other platforms fail explicitly.
+
+Windows, in an existing Python/PyTorch/Diffusers environment:
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES='-1'
@@ -30,6 +36,22 @@ $env:OMP_NUM_THREADS='2'
 $env:MKL_NUM_THREADS='2'
 python -B -u -m unittest discover -s tests -p test_native_contracts.py -v
 ```
+
+Linux, in an environment with the test dependencies installed:
+
+```sh
+CUDA_VISIBLE_DEVICES=-1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+python -B -u -m unittest discover -s tests -p test_native_contracts.py -v
+```
+
+The manually dispatched `.github/workflows/cpu-regressions.yml` prepares an
+Ubuntu/Python 3.12 environment with pinned CPU-only PyTorch and test libraries.
+It does not install the project's training dependencies or download model
+weights. GitHub requires the workflow on the fork's default branch before it
+can be dispatched for a selected contribution branch. There are no automatic
+push or pull-request triggers. A local workflow file is not a successful Linux
+test result.
 
 The tests cover conditioning contracts, positional roles, sigma indexing,
 residual routing, staged gradients, checkpointed backward, and serialization.

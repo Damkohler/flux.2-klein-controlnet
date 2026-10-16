@@ -2,8 +2,6 @@
 import argparse
 import ast
 import contextlib
-import ctypes
-from ctypes import wintypes
 import json
 import inspect
 import io
@@ -38,20 +36,27 @@ torch.set_num_interop_threads(1)
 torch.set_default_dtype(torch.float32)
 
 
-class MemoryCounters(ctypes.Structure):
-    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
-                ("PrivateUsage", ctypes.c_size_t)]
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t)]
 
 
-def cpu_resources():
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "-1" or torch.cuda.is_initialized():
-        raise RuntimeError("Tests require CUDA_VISIBLE_DEVICES=-1 and uninitialized CUDA")
-    if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get("TRANSFORMERS_OFFLINE") != "1":
-        raise RuntimeError("Tests require Hugging Face and Transformers offline controls")
+def process_memory_bytes():
+    if sys.platform == "linux":
+        import resource
+
+        # Linux reports ru_maxrss in KiB, not Windows private-commit bytes.
+        return dict(peak_rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+    if sys.platform != "win32":
+        raise RuntimeError("The test memory guard supports Windows and Linux only")
     counters = MemoryCounters()
     counters.cb = ctypes.sizeof(counters)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -60,11 +65,20 @@ def cpu_resources():
     psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
     if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
         raise ctypes.WinError(ctypes.get_last_error())
-    if max(counters.PeakWorkingSetSize, counters.PeakPagefileUsage, counters.PrivateUsage) > 2 * 2**30:
+    return dict(peak_working_set=counters.PeakWorkingSetSize,
+                peak_private_commit=counters.PeakPagefileUsage, private=counters.PrivateUsage)
+
+
+def cpu_resources():
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != "-1" or torch.cuda.is_initialized():
+        raise RuntimeError("Tests require CUDA_VISIBLE_DEVICES=-1 and uninitialized CUDA")
+    if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get("TRANSFORMERS_OFFLINE") != "1":
+        raise RuntimeError("Tests require Hugging Face and Transformers offline controls")
+    memory = process_memory_bytes()
+    if max(memory.values()) > 2 * 2**30:
         raise MemoryError("Conservative 2 GiB process memory guard exceeded")
-    return dict(peak_working_set_MiB=round(counters.PeakWorkingSetSize / 2**20, 2),
-                peak_private_commit_MiB=round(counters.PeakPagefileUsage / 2**20, 2),
-                private_MiB=round(counters.PrivateUsage / 2**20, 2), cuda_initialized=False)
+    return dict({name + "_MiB": round(value / 2**20, 2) for name, value in memory.items()},
+                cuda_initialized=False)
 
 
 def setUpModule():
@@ -73,6 +87,30 @@ def setUpModule():
 
 def tearDownModule():
     print(json.dumps(dict(cpu_resources=cpu_resources())), flush=True)
+
+
+class MemorySafeguards(unittest.TestCase):
+    def test_linux_peak_rss_units(self):
+        resource = types.SimpleNamespace(RUSAGE_SELF=0,
+                                        getrusage=mock.Mock(return_value=types.SimpleNamespace(ru_maxrss=1536 * 1024)))
+        with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(sys.modules, resource=resource):
+            self.assertEqual(process_memory_bytes(), dict(peak_rss=1536 * 2**20))
+            self.assertEqual(cpu_resources()["peak_rss_MiB"], 1536)
+        resource.getrusage.assert_called_with(resource.RUSAGE_SELF)
+
+    def test_two_gib_boundary_for_each_memory_counter(self):
+        for name in ("peak_rss", "peak_working_set", "peak_private_commit", "private"):
+            with self.subTest(counter=name):
+                with mock.patch(__name__ + ".process_memory_bytes", return_value={name: 2 * 2**30}):
+                    self.assertEqual(cpu_resources()[name + "_MiB"], 2048)
+                with mock.patch(__name__ + ".process_memory_bytes", return_value={name: 2 * 2**30 + 1}):
+                    with self.assertRaisesRegex(MemoryError, "2 GiB"):
+                        cpu_resources()
+
+    def test_unsupported_platform_does_not_skip_memory_guard(self):
+        with mock.patch.object(sys, "platform", "darwin"):
+            with self.assertRaisesRegex(RuntimeError, "Windows and Linux"):
+                process_memory_bytes()
 
 
 def definition(path, name):
